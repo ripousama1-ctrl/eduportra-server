@@ -1,4 +1,5 @@
 const express = require('express');
+require('dotenv').config();
 const cors = require('cors');
 const path = require('path');
 const mongoose = require('mongoose');
@@ -7,13 +8,13 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-const uri = "mongodb+srv://ripousama1:osama1234@eduporta.gwpzjnr.mongodb.net/eduportra?retryWrites=true&w=majority";
+const uri =(process.env.MONGO_URI)
 
 mongoose.connect(uri)
   .then(() => {
     console.log("MongoDB connected");
 
-    const port = 8080;
+    const port = process.env.PORT || 8080;
     app.get('/', (req, res) => {
   res.send('Server is working 🚀');
 });
