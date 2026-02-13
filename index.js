@@ -9,8 +9,25 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI || '';
 
-app.use(cors());
-app.use(express.json());
+app.set('trust proxy', 1);
+app.disable('x-powered-by');
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);
+    if (allowedOrigins.length === 0 || allowedOrigins.includes(origin)) return cb(null, true);
+    return cb(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+}));
+app.use(express.json({ limit: process.env.JSON_LIMIT || '200kb' }));
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Strict-Transport-Security', 'max-age=15552000; includeSubDomains');
+  next();
+});
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'tiny'));
 
 const dataDir = path.join(process.cwd(), 'data');
@@ -19,6 +36,39 @@ const attendanceFile = path.join(dataDir, 'attendance.json');
 const studentsFile = path.join(dataDir, 'students.json');
 const examResultsFile = path.join(dataDir, 'exam_results.json');
 
+function safeStr(v, maxLen = 200) {
+  return String(v || '').replace(/[\r\n\t]/g, ' ').trim().slice(0, maxLen);
+}
+
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000);
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 180);
+const rateStore = new Map();
+function rateLimiter(req, res, next) {
+  const now = Date.now();
+  const ip = req.ip || req.connection.remoteAddress || 'unknown';
+  let entry = rateStore.get(ip);
+  if (!entry || now > entry.resetAt) {
+    entry = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+    rateStore.set(ip, entry);
+  }
+  entry.count += 1;
+  if (entry.count > RATE_LIMIT_MAX) return res.status(429).json({ error: 'too_many_requests' });
+  next();
+}
+app.use(rateLimiter);
+
+const writeQueues = new Map();
+function queueWrite(filePath, mutator) {
+  const prev = writeQueues.get(filePath) || Promise.resolve();
+  const next = prev.then(async () => {
+    const buf = await fs.promises.readFile(filePath, 'utf-8');
+    const json = JSON.parse(buf);
+    const updated = await mutator(json);
+    await fs.promises.writeFile(filePath, JSON.stringify(updated, null, 2));
+  }).catch(() => {});
+  writeQueues.set(filePath, next);
+  return next;
+}
 function ensureDataFile() {
   if (!fs.existsSync(dataDir)) {
     fs.mkdirSync(dataDir, { recursive: true });
@@ -92,21 +142,24 @@ app.get('/api/exams', async (_, res) => {
 app.post('/api/exams', async (req, res) => {
   try {
     const { subject = '', department = '', level = '', tfCount = 0, mcqCount = 0, questions = [] } = req.body || {};
-    if (!subject || !department || !level) {
+    const subjectS = safeStr(subject, 100);
+    const departmentS = safeStr(department, 100);
+    const levelS = safeStr(level, 100);
+    if (!subjectS || !departmentS || !levelS) {
       res.status(400).json({ error: 'invalid_payload' });
       return;
     }
     if (dbConnected && ExamModel) {
-      const doc = await ExamModel.create({ subject, department, level, tfCount, mcqCount, questions });
+      const doc = await ExamModel.create({ subject: subjectS, department: departmentS, level: levelS, tfCount, mcqCount, questions });
       res.json({ id: doc._id.toString() });
       return;
     }
-    const buf = fs.readFileSync(examsFile, 'utf-8');
-    const items = JSON.parse(buf);
     const id = Math.random().toString(36).slice(2);
     const createdAt = new Date().toISOString();
-    items.unshift({ id, subject, department, level, tfCount, mcqCount, questions, createdAt });
-    fs.writeFileSync(examsFile, JSON.stringify(items, null, 2));
+    await queueWrite(examsFile, (items) => {
+      items.unshift({ id, subject: subjectS, department: departmentS, level: levelS, tfCount, mcqCount, questions, createdAt });
+      return items;
+    });
     res.json({ id });
   } catch (e) {
     res.status(500).json({ error: 'create_failed', message: e.message });
@@ -139,10 +192,7 @@ app.delete('/api/exams/:id', async (req, res) => {
       res.json({ ok: true });
       return;
     }
-    const buf = fs.readFileSync(examsFile, 'utf-8');
-    const items = JSON.parse(buf);
-    const next = items.filter(i => (i.id || i._id) !== id);
-    fs.writeFileSync(examsFile, JSON.stringify(next, null, 2));
+    await queueWrite(examsFile, (items) => items.filter(i => (i.id || i._id) !== id));
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: 'delete_failed', message: e.message });
@@ -173,11 +223,10 @@ app.delete('/api/attendance/clear', (req, res) => {
   const lectureId = String(req.query.lectureId || '').trim();
   if (!lectureId) return res.status(400).json({ error: 'invalid_input' });
   try {
-    const buf = fs.readFileSync(attendanceFile, 'utf-8');
-    const items = JSON.parse(buf);
-    const next = items.filter(i => String(i.lectureId || '') !== lectureId);
-    fs.writeFileSync(attendanceFile, JSON.stringify(next, null, 2));
-    res.json({ ok: true });
+    queueWrite(attendanceFile, (items) => items.filter(i => String(i.lectureId || '') !== lectureId))
+      .then(() => res.json({ ok: true }))
+      .catch(() => res.status(500).json({ error: 'db_error' }));
+    return;
   } catch (e) {
     res.status(500).json({ error: 'db_error' });
   }
@@ -188,11 +237,10 @@ app.delete('/api/attendance/student', (req, res) => {
   const studentCode = String(req.query.studentCode || '').trim();
   if (!lectureId || !studentCode) return res.status(400).json({ error: 'invalid_input' });
   try {
-    const buf = fs.readFileSync(attendanceFile, 'utf-8');
-    const items = JSON.parse(buf);
-    const next = items.filter(i => !(String(i.lectureId || '') === lectureId && String(i.studentCode || '') === studentCode));
-    fs.writeFileSync(attendanceFile, JSON.stringify(next, null, 2));
-    res.json({ ok: true });
+    queueWrite(attendanceFile, (items) => items.filter(i => !(String(i.lectureId || '') === lectureId && String(i.studentCode || '') === studentCode)))
+      .then(() => res.json({ ok: true }))
+      .catch(() => res.status(500).json({ error: 'db_error' }));
+    return;
   } catch (e) {
     res.status(500).json({ error: 'db_error' });
   }
@@ -200,8 +248,10 @@ app.delete('/api/attendance/student', (req, res) => {
 
 app.delete('/api/attendance/all', (req, res) => {
   try {
-    fs.writeFileSync(attendanceFile, JSON.stringify([]));
-    res.json({ ok: true });
+    queueWrite(attendanceFile, () => [])
+      .then(() => res.json({ ok: true }))
+      .catch(() => res.status(500).json({ error: 'db_error' }));
+    return;
   } catch (e) {
     res.status(500).json({ error: 'db_error' });
   }
@@ -234,20 +284,19 @@ app.get('/api/students', (req, res) => {
 app.post('/api/students', (req, res) => {
   try {
     const b = req.body || {};
-    const studentCode = String(b.studentCode || b.code || '').trim();
-    const fullName = String(b.fullName || b.name || '').trim();
-    const department = String(b.department || '').trim();
-    const level = String(b.level || '').trim();
-    const status = String(b.status || '').trim();
+    const studentCode = safeStr(b.studentCode || b.code, 64);
+    const fullName = safeStr(b.fullName || b.name, 128);
+    const department = safeStr(b.department, 64);
+    const level = safeStr(b.level, 64);
+    const status = safeStr(b.status, 64);
     if (!studentCode || !fullName) return res.status(400).json({ error: 'invalid_input' });
-    const buf = fs.readFileSync(studentsFile, 'utf-8');
-    const items = JSON.parse(buf);
-    if (items.find(s => String(s.studentCode || s.code || '') === studentCode)) {
-      return res.json({ ok: true, duplicated: true });
-    }
-    items.push({ studentCode, fullName, department, level, status });
-    fs.writeFileSync(studentsFile, JSON.stringify(items, null, 2));
-    res.json({ ok: true });
+    queueWrite(studentsFile, (items) => {
+      if (items.find(s => String(s.studentCode || s.code || '') === studentCode)) {
+        return items;
+      }
+      items.push({ studentCode, fullName, department, level, status });
+      return items;
+    }).then(() => res.json({ ok: true })).catch(() => res.status(500).json({ error: 'db_error' }));
   } catch (e) {
     res.status(500).json({ error: 'db_error' });
   }
@@ -255,13 +304,12 @@ app.post('/api/students', (req, res) => {
 
 app.delete('/api/students/:code', (req, res) => {
   try {
-    const code = String(req.params.code || '').trim();
+    const code = safeStr(req.params.code, 64);
     if (!code) return res.status(400).json({ error: 'invalid_input' });
-    const buf = fs.readFileSync(studentsFile, 'utf-8');
-    const items = JSON.parse(buf);
-    const next = items.filter(s => String(s.studentCode || s.code || '') !== code);
-    fs.writeFileSync(studentsFile, JSON.stringify(next, null, 2));
-    res.json({ ok: true });
+    queueWrite(studentsFile, (items) => items.filter(s => String(s.studentCode || s.code || '') !== code))
+      .then(() => res.json({ ok: true }))
+      .catch(() => res.status(500).json({ error: 'db_error' }));
+    return;
   } catch (e) {
     res.status(500).json({ error: 'db_error' });
   }
@@ -270,22 +318,21 @@ app.delete('/api/students/:code', (req, res) => {
 app.post('/api/students/import-bulk', (req, res) => {
   try {
     const list = Array.isArray(req.body) ? req.body : [];
-    const buf = fs.readFileSync(studentsFile, 'utf-8');
-    const items = JSON.parse(buf);
-    const byCode = new Map(items.map(s => [String(s.studentCode || s.code || ''), s]));
-    for (const raw of list) {
-      const studentCode = String(raw.studentCode || raw.code || '').trim();
-      const fullName = String(raw.fullName || raw.name || '').trim();
-      const department = String(raw.department || '').trim();
-      const level = String(raw.level || '').trim();
-      const status = String(raw.status || '').trim();
-      if (!studentCode || !fullName) continue;
-      if (byCode.has(studentCode)) continue;
-      items.push({ studentCode, fullName, department, level, status });
-      byCode.set(studentCode, true);
-    }
-    fs.writeFileSync(studentsFile, JSON.stringify(items, null, 2));
-    res.json({ ok: true, count: list.length });
+    queueWrite(studentsFile, (items) => {
+      const byCode = new Map(items.map(s => [String(s.studentCode || s.code || ''), s]));
+      for (const raw of list) {
+        const studentCode = safeStr(raw.studentCode || raw.code, 64);
+        const fullName = safeStr(raw.fullName || raw.name, 128);
+        const department = safeStr(raw.department, 64);
+        const level = safeStr(raw.level, 64);
+        const status = safeStr(raw.status, 64);
+        if (!studentCode || !fullName) continue;
+        if (byCode.has(studentCode)) continue;
+        items.push({ studentCode, fullName, department, level, status });
+        byCode.set(studentCode, true);
+      }
+      return items;
+    }).then(() => res.json({ ok: true, count: list.length })).catch(() => res.status(500).json({ error: 'db_error' }));
   } catch (e) {
     res.status(500).json({ error: 'db_error' });
   }
@@ -294,21 +341,20 @@ app.post('/api/students/import-bulk', (req, res) => {
 app.post('/api/exam-results', (req, res) => {
   try {
     const b = req.body || {};
-    const studentCode = String(b.studentCode || '').trim();
-    const examId = String(b.examId || '').trim();
-    const department = String(b.department || '').trim();
-    const level = String(b.level || '').trim();
+    const studentCode = safeStr(b.studentCode, 64);
+    const examId = safeStr(b.examId, 64);
+    const department = safeStr(b.department, 64);
+    const level = safeStr(b.level, 64);
     const correct = Number(b.correct || 0);
     const wrong = Number(b.wrong || 0);
     const total = Number(b.total || 0);
     const score = Number(b.score || 0);
     const submittedAt = String(b.submittedAt || new Date().toISOString());
     if (!studentCode || !examId) return res.status(400).json({ error: 'invalid_input' });
-    const buf = fs.readFileSync(examResultsFile, 'utf-8');
-    const items = JSON.parse(buf);
-    items.push({ studentCode, examId, department, level, correct, wrong, total, score, submittedAt });
-    fs.writeFileSync(examResultsFile, JSON.stringify(items, null, 2));
-    res.json({ ok: true });
+    queueWrite(examResultsFile, (items) => {
+      items.push({ studentCode, examId, department, level, correct, wrong, total, score, submittedAt });
+      return items;
+    }).then(() => res.json({ ok: true })).catch(() => res.status(500).json({ error: 'db_error' }));
   } catch (e) {
     res.status(500).json({ error: 'db_error' });
   }
@@ -378,32 +424,32 @@ app.post('/api/auth/login', (req, res) => {
 app.post('/mark-attendance', (req, res) => {
   try {
     const b = req.body || {};
-    const lectureId = String(b.lectureId || '').trim();
+    const lectureId = safeStr(b.lectureId, 64);
     const timestamp = Number(b.timestamp || Date.now());
-    const studentCode = String(b.studentId || b.studentCode || '').trim();
-    const studentName = String(b.name || b.studentName || '').trim();
-    const department = String(b.department || '').trim();
-    const level = String(b.level || '').trim();
-    const status = String(b.status || '').trim();
+    const studentCode = safeStr(b.studentId || b.studentCode, 64);
+    const studentName = safeStr(b.name || b.studentName, 128);
+    const department = safeStr(b.department, 64);
+    const level = safeStr(b.level, 64);
+    const status = safeStr(b.status, 64);
     if (!lectureId || !studentCode || !studentName) {
       return res.status(400).json({ error: 'invalid_input' });
     }
-    const buf = fs.readFileSync(attendanceFile, 'utf-8');
-    const items = JSON.parse(buf);
-    items.push({
-      lectureId,
-      time: timestamp,
-      studentCode,
-      studentName,
-      department,
-      level,
-      status,
-    });
-    fs.writeFileSync(attendanceFile, JSON.stringify(items, null, 2));
-    res.json({ ok: true });
+    queueWrite(attendanceFile, (items) => {
+      items.push({
+        lectureId,
+        time: timestamp,
+        studentCode,
+        studentName,
+        department,
+        level,
+        status,
+      });
+      return items;
+    }).then(() => res.json({ ok: true })).catch(() => res.status(500).json({ error: 'db_error' }));
   } catch (e) {
     res.status(500).json({ error: 'db_error' });
   }
 });
 
-app.listen(PORT, () => {});
+const server = app.listen(PORT, () => {});
+server.setTimeout(Number(process.env.REQUEST_TIMEOUT_MS || 30000));
