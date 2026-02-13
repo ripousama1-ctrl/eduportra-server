@@ -16,6 +16,7 @@ app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'tiny'));
 const dataDir = path.join(process.cwd(), 'data');
 const examsFile = path.join(dataDir, 'exams.json');
 const attendanceFile = path.join(dataDir, 'attendance.json');
+const studentsFile = path.join(dataDir, 'students.json');
 
 function ensureDataFile() {
   if (!fs.existsSync(dataDir)) {
@@ -26,6 +27,9 @@ function ensureDataFile() {
   }
   if (!fs.existsSync(attendanceFile)) {
     fs.writeFileSync(attendanceFile, JSON.stringify([]));
+  }
+  if (!fs.existsSync(studentsFile)) {
+    fs.writeFileSync(studentsFile, JSON.stringify([]));
   }
 }
 
@@ -194,6 +198,91 @@ app.delete('/api/attendance/all', (req, res) => {
   try {
     fs.writeFileSync(attendanceFile, JSON.stringify([]));
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
+// Students
+app.get('/api/students', (req, res) => {
+  try {
+    const department = String(req.query.department || '').trim();
+    const level = String(req.query.level || '').trim();
+    const buf = fs.readFileSync(studentsFile, 'utf-8');
+    const items = JSON.parse(buf);
+    const normalized = items.map(s => ({
+      studentCode: String(s.studentCode || s.code || '').trim(),
+      fullName: String(s.fullName || s.name || '').trim(),
+      department: String(s.department || '').trim(),
+      level: String(s.level || '').trim(),
+      status: String(s.status || '').trim(),
+    })).filter(s => s.studentCode && s.fullName);
+    const filtered = normalized.filter(s => {
+      const okDept = department ? s.department === department : true;
+      const okLevel = level ? s.level === level : true;
+      return okDept && okLevel;
+    });
+    res.json({ students: filtered });
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
+app.post('/api/students', (req, res) => {
+  try {
+    const b = req.body || {};
+    const studentCode = String(b.studentCode || b.code || '').trim();
+    const fullName = String(b.fullName || b.name || '').trim();
+    const department = String(b.department || '').trim();
+    const level = String(b.level || '').trim();
+    const status = String(b.status || '').trim();
+    if (!studentCode || !fullName) return res.status(400).json({ error: 'invalid_input' });
+    const buf = fs.readFileSync(studentsFile, 'utf-8');
+    const items = JSON.parse(buf);
+    if (items.find(s => String(s.studentCode || s.code || '') === studentCode)) {
+      return res.json({ ok: true, duplicated: true });
+    }
+    items.push({ studentCode, fullName, department, level, status });
+    fs.writeFileSync(studentsFile, JSON.stringify(items, null, 2));
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
+app.delete('/api/students/:code', (req, res) => {
+  try {
+    const code = String(req.params.code || '').trim();
+    if (!code) return res.status(400).json({ error: 'invalid_input' });
+    const buf = fs.readFileSync(studentsFile, 'utf-8');
+    const items = JSON.parse(buf);
+    const next = items.filter(s => String(s.studentCode || s.code || '') !== code);
+    fs.writeFileSync(studentsFile, JSON.stringify(next, null, 2));
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
+app.post('/api/students/import-bulk', (req, res) => {
+  try {
+    const list = Array.isArray(req.body) ? req.body : [];
+    const buf = fs.readFileSync(studentsFile, 'utf-8');
+    const items = JSON.parse(buf);
+    const byCode = new Map(items.map(s => [String(s.studentCode || s.code || ''), s]));
+    for (const raw of list) {
+      const studentCode = String(raw.studentCode || raw.code || '').trim();
+      const fullName = String(raw.fullName || raw.name || '').trim();
+      const department = String(raw.department || '').trim();
+      const level = String(raw.level || '').trim();
+      const status = String(raw.status || '').trim();
+      if (!studentCode || !fullName) continue;
+      if (byCode.has(studentCode)) continue;
+      items.push({ studentCode, fullName, department, level, status });
+      byCode.set(studentCode, true);
+    }
+    fs.writeFileSync(studentsFile, JSON.stringify(items, null, 2));
+    res.json({ ok: true, count: list.length });
   } catch (e) {
     res.status(500).json({ error: 'db_error' });
   }
