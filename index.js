@@ -29,12 +29,24 @@ app.use((req, res, next) => {
   next();
 });
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'tiny'));
+// Static files for uploads (PDFs)
+app.use('/uploads', express.static(uploadsDir, {
+  setHeaders: (res, p) => {
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+  }
+}));
 
 const dataDir = path.join(process.cwd(), 'data');
 const examsFile = path.join(dataDir, 'exams.json');
 const attendanceFile = path.join(dataDir, 'attendance.json');
 const studentsFile = path.join(dataDir, 'students.json');
 const examResultsFile = path.join(dataDir, 'exam_results.json');
+const schedulesFile = path.join(dataDir, 'schedules.json');
+const announcementsFile = path.join(dataDir, 'announcements.json');
+const uploadsDir = path.join(process.cwd(), 'uploads');
+const materialsDir = path.join(uploadsDir, 'materials');
+const materialsFile = path.join(dataDir, 'materials.json');
 
 function safeStr(v, maxLen = 200) {
   return String(v || '').replace(/[\r\n\t]/g, ' ').trim().slice(0, maxLen);
@@ -73,6 +85,12 @@ function ensureDataFile() {
   if (!fs.existsSync(dataDir)) {
     fs.mkdirSync(dataDir, { recursive: true });
   }
+  if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+  }
+  if (!fs.existsSync(materialsDir)) {
+    fs.mkdirSync(materialsDir, { recursive: true });
+  }
   if (!fs.existsSync(examsFile)) {
     fs.writeFileSync(examsFile, JSON.stringify([]));
   }
@@ -84,6 +102,15 @@ function ensureDataFile() {
   }
   if (!fs.existsSync(examResultsFile)) {
     fs.writeFileSync(examResultsFile, JSON.stringify([]));
+  }
+  if (!fs.existsSync(schedulesFile)) {
+    fs.writeFileSync(schedulesFile, JSON.stringify([]));
+  }
+  if (!fs.existsSync(announcementsFile)) {
+    fs.writeFileSync(announcementsFile, JSON.stringify([]));
+  }
+  if (!fs.existsSync(materialsFile)) {
+    fs.writeFileSync(materialsFile, JSON.stringify([]));
   }
 }
 
@@ -182,6 +209,81 @@ app.get('/api/exams/:id', async (req, res) => {
     res.json({ exam });
   } catch (e) {
     res.status(500).json({ error: 'fetch_failed' });
+  }
+});
+
+// Schedules
+app.get('/api/schedules', (req, res) => {
+  try {
+    const department = safeStr(req.query.department, 64);
+    const level = safeStr(req.query.level, 64);
+    const isExamQ = req.query.isExam;
+    const buf = fs.readFileSync(schedulesFile, 'utf-8');
+    const items = JSON.parse(buf);
+    const filtered = items.filter(i => {
+      const okDept = department ? String(i.department || '') === department : true;
+      const okLevel = level ? String(i.level || '') === level : true;
+      const okExam = typeof isExamQ === 'string' ? String(i.isExam || false) === (isExamQ === 'true' ? 'true' : 'false') : true;
+      return okDept && okLevel && okExam;
+    });
+    res.json({ items: filtered });
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
+app.post('/api/schedules', (req, res) => {
+  try {
+    const b = req.body || {};
+    const subject = safeStr(b.subject, 128);
+    const day = safeStr(b.day, 64);
+    const date = safeStr(b.date, 64);
+    const time = safeStr(b.time, 64);
+    const location = safeStr(b.location, 128);
+    const department = safeStr(b.department, 64);
+    const level = safeStr(b.level, 64);
+    const imageUrl = safeStr(b.imageUrl, 512);
+    const isExam = Boolean(b.isExam);
+    if (!department || !level || (!subject && !imageUrl)) return res.status(400).json({ error: 'invalid_input' });
+    const id = Math.random().toString(36).slice(2);
+    const item = { id, subject, day, date, time, location, department, level, imageUrl, isExam };
+    queueWrite(schedulesFile, (items) => {
+      items.unshift(item);
+      return items;
+    }).then(() => res.json({ id })).catch(() => res.status(500).json({ error: 'db_error' }));
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
+app.post('/api/schedules/image', (req, res) => {
+  try {
+    const b = req.body || {};
+    const department = safeStr(b.department, 64);
+    const level = safeStr(b.level, 64);
+    const imageUrl = safeStr(b.imageUrl, 512);
+    const isExam = Boolean(b.isExam);
+    if (!department || !level || !imageUrl) return res.status(400).json({ error: 'invalid_input' });
+    const id = Math.random().toString(36).slice(2);
+    const item = { id, subject: '', day: '', date: '', time: '', location: '', department, level, imageUrl, isExam };
+    queueWrite(schedulesFile, (items) => {
+      items.unshift(item);
+      return items;
+    }).then(() => res.json({ id })).catch(() => res.status(500).json({ error: 'db_error' }));
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
+app.delete('/api/schedules/:id', (req, res) => {
+  try {
+    const id = safeStr(req.params.id, 64);
+    if (!id) return res.status(400).json({ error: 'invalid_input' });
+    queueWrite(schedulesFile, (items) => items.filter(i => String(i.id || i._id) !== id))
+      .then(() => res.json({ ok: true }))
+      .catch(() => res.status(500).json({ error: 'db_error' }));
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
   }
 });
 app.delete('/api/exams/:id', async (req, res) => {
@@ -375,6 +477,145 @@ app.get('/api/exam-results/latest', (req, res) => {
   }
 });
 
+// Announcements
+app.get('/api/announcements', (req, res) => {
+  try {
+    const buf = fs.readFileSync(announcementsFile, 'utf-8');
+    const items = JSON.parse(buf);
+    res.json({ items });
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
+app.post('/api/announcements', (req, res) => {
+  try {
+    const b = req.body || {};
+    const title = safeStr(b.title, 200);
+    const content = safeStr(b.content, 5000);
+    const date = safeStr(b.date || new Date().toISOString(), 64);
+    const priority = safeStr(b.priority || 'عادي', 32);
+    const readByStudentIds = Array.isArray(b.readByStudentIds) ? b.readByStudentIds.map(s => safeStr(s, 64)) : [];
+    if (!title || !content) return res.status(400).json({ error: 'invalid_input' });
+    const id = Math.random().toString(36).slice(2);
+    const item = { id, title, content, date, priority, readByStudentIds };
+    queueWrite(announcementsFile, (items) => {
+      items.unshift(item);
+      return items;
+    }).then(() => res.json({ id })).catch(() => res.status(500).json({ error: 'db_error' }));
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
+app.delete('/api/announcements/:id', (req, res) => {
+  try {
+    const id = safeStr(req.params.id, 64);
+    if (!id) return res.status(400).json({ error: 'invalid_input' });
+    queueWrite(announcementsFile, (items) => items.filter(i => String(i.id || i._id) !== id))
+      .then(() => res.json({ ok: true }))
+      .catch(() => res.status(500).json({ error: 'db_error' }));
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
+app.post('/api/announcements/:id/read', (req, res) => {
+  try {
+    const id = safeStr(req.params.id, 64);
+    const studentId = safeStr((req.body || {}).studentId, 64);
+    if (!id || !studentId) return res.status(400).json({ error: 'invalid_input' });
+    queueWrite(announcementsFile, (items) => {
+      for (const it of items) {
+        if (String(it.id || it._id) === id) {
+          if (!Array.isArray(it.readByStudentIds)) it.readByStudentIds = [];
+          if (!it.readByStudentIds.includes(studentId)) it.readByStudentIds.push(studentId);
+          break;
+        }
+      }
+      return items;
+    }).then(() => res.json({ ok: true })).catch(() => res.status(500).json({ error: 'db_error' }));
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
+// Course Materials (PDF)
+app.get('/api/materials', (req, res) => {
+  try {
+    const department = safeStr(req.query.department, 64);
+    const level = safeStr(req.query.level, 64);
+    const subject = safeStr(req.query.subject, 128);
+    const buf = fs.readFileSync(materialsFile, 'utf-8');
+    const items = JSON.parse(buf);
+    const filtered = items.filter(m => {
+      const okDept = department ? String(m.department || '') === department : true;
+      const okLevel = level ? String(m.level || '') === level : true;
+      const okSubject = subject ? String(m.subject || '') === subject : true;
+      return okDept && okLevel && okSubject;
+    });
+    res.json({ items: filtered });
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
+app.post('/api/materials', async (req, res) => {
+  try {
+    const MAX_SIZE = Number(process.env.MAX_MATERIAL_SIZE || 10 * 1024 * 1024); // 10MB
+    const b = req.body || {};
+    const department = safeStr(b.department, 64);
+    const level = safeStr(b.level, 64);
+    const subject = safeStr(b.subject, 128);
+    const teacherName = safeStr(b.teacherName, 128);
+    const fileName = safeStr(b.fileName, 128);
+    const fileBase64 = String(b.fileBase64 || '');
+    if (!fileBase64) return res.status(400).json({ error: 'invalid_input' });
+    const nameLower = fileName.toLowerCase();
+    if (!nameLower.endsWith('.pdf')) return res.status(400).json({ error: 'invalid_type' });
+    const base64Data = fileBase64.includes('base64,') ? fileBase64.split('base64,').pop() : fileBase64;
+    const buf = Buffer.from(base64Data, 'base64');
+    if (!buf || buf.length === 0) return res.status(400).json({ error: 'invalid_file' });
+    if (buf.length > MAX_SIZE) return res.status(413).json({ error: 'file_too_large' });
+    const id = Math.random().toString(36).slice(2);
+    const storedName = `${id}.pdf`;
+    await fs.promises.writeFile(path.join(materialsDir, storedName), buf);
+    const url = `/uploads/materials/${storedName}`;
+    const uploadedAt = new Date().toISOString();
+    await queueWrite(materialsFile, (items) => {
+      items.unshift({ id, url, originalName: fileName, department, level, subject, teacherName, uploadedAt });
+      return items;
+    });
+    res.json({ id, url });
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
+app.delete('/api/materials/:id', async (req, res) => {
+  try {
+    const id = safeStr(req.params.id, 64);
+    if (!id) return res.status(400).json({ error: 'invalid_input' });
+    let fileToDelete = null;
+    await queueWrite(materialsFile, (items) => {
+      const found = items.find(m => String(m.id || m._id) === id);
+      if (found && found.url) {
+        const p = String(found.url).replace('/uploads/materials/', '');
+        fileToDelete = p;
+      }
+      return items.filter(m => String(m.id || m._id) !== id);
+    });
+    if (fileToDelete) {
+      const full = path.join(materialsDir, fileToDelete);
+      if (fs.existsSync(full)) {
+        try { await fs.promises.unlink(full); } catch (_) {}
+      }
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
 app.post('/api/auth/login', (req, res) => {
   try {
     const b = req.body || {};
