@@ -125,7 +125,10 @@ ensureDataFile();
 let dbConnected = false;
 let ExamModel = null;
 let MaterialsModel = null;
+let SessionModel = null;
 let gfsBucket = null;
+const sessions = new Map();
+const sessionsByCode = new Map();
 
 async function connectMongo() {
   if (!MONGODB_URI) return;
@@ -151,6 +154,15 @@ async function connectMongo() {
       uploadedAt: { type: Date, default: Date.now },
     }, { timestamps: true });
     MaterialsModel = mongoose.model('Material', materialsSchema);
+    const sessionSchema = new mongoose.Schema({
+      userId: { type: String, required: true, index: true },
+      lectureId: { type: String, required: true, index: true },
+      code: { type: String, required: true, unique: true },
+      expiresAt: { type: Date, required: true, index: true },
+      createdAt: { type: Date, default: Date.now },
+    }, { timestamps: true });
+    sessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+    SessionModel = mongoose.model('Session', sessionSchema);
     gfsBucket = new mongoose.mongo.GridFSBucket(mongoose.connection.db, { bucketName: 'uploads' });
     dbConnected = true;
   } catch (e) {
@@ -166,6 +178,73 @@ app.get('/', (_, res) => {
 
 app.get('/health/db', async (_, res) => {
   res.json({ state: dbConnected ? 1 : 0 });
+});
+
+// Attendance session APIs
+function genCode() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+app.post('/api/session/start', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const userId = safeStr(b.userId, 64);
+    const lectureId = safeStr(b.lectureId || `LECTURE-${Date.now()}`, 128);
+    const durationMinutes = Math.max(1, Math.min(60, Number(b.durationMinutes || 15)));
+    if (!userId) return res.status(400).json({ error: 'invalid_input' });
+    const code = genCode();
+    const expiresAt = Date.now() + durationMinutes * 60 * 1000;
+    const session = { code, expiresAt, userId, lectureId };
+    sessions.set(lectureId, session);
+    sessionsByCode.set(code, lectureId);
+    if (dbConnected && SessionModel) {
+      try {
+        await SessionModel.deleteMany({ userId });
+      } catch (_) {}
+      await SessionModel.create({ userId, lectureId, code, expiresAt: new Date(expiresAt) });
+    }
+    res.json({ code, expiresAt, lectureId });
+  } catch (e) {
+    res.status(500).json({ error: 'session_failed' });
+  }
+});
+app.get('/api/session/active', async (req, res) => {
+  try {
+    const userId = safeStr(req.query.userId, 64);
+    if (!userId) return res.json({});
+    if (dbConnected && SessionModel) {
+      const now = new Date();
+      const s = await SessionModel.findOne({ userId, expiresAt: { $gt: now } }).sort({ expiresAt: -1 }).lean();
+      if (s) return res.json({ code: s.code, expiresAt: new Date(s.expiresAt).getTime(), lectureId: s.lectureId });
+    } else {
+      for (const s of sessions.values()) {
+        if (s.userId === userId && s.expiresAt > Date.now()) {
+          return res.json({ code: s.code, expiresAt: s.expiresAt, lectureId: s.lectureId });
+        }
+      }
+    }
+    res.json({});
+  } catch (e) {
+    res.status(500).json({ error: 'fetch_failed' });
+  }
+});
+app.get('/api/session/resolve', async (req, res) => {
+  try {
+    const code = safeStr(req.query.code, 16);
+    if (!code) return res.status(400).json({ error: 'invalid_input' });
+    if (dbConnected && SessionModel) {
+      const now = new Date();
+      const s = await SessionModel.findOne({ code, expiresAt: { $gt: now } }).lean();
+      if (!s) return res.status(404).json({ error: 'not_found' });
+      return res.json({ lectureId: s.lectureId, expiresAt: new Date(s.expiresAt).getTime(), timestamp: Date.now() });
+    }
+    const lectureId = sessionsByCode.get(code);
+    if (!lectureId) return res.status(404).json({ error: 'not_found' });
+    const s = sessions.get(lectureId);
+    if (!s || s.expiresAt <= Date.now()) return res.status(410).json({ error: 'expired' });
+    res.json({ lectureId, expiresAt: s.expiresAt, timestamp: Date.now() });
+  } catch (e) {
+    res.status(500).json({ error: 'fetch_failed' });
+  }
 });
 
 app.get('/files/:id', async (req, res) => {
