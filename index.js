@@ -8,6 +8,7 @@ import mongoose from 'mongoose';
 const app = express();
 const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI || '';
+<<<<<<< HEAD
 
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
@@ -81,10 +82,21 @@ function queueWrite(filePath, mutator) {
   writeQueues.set(filePath, next);
   return next;
 }
+=======
+
+app.use(cors());
+app.use(express.json());
+app.use(morgan('dev'));
+
+const dataDir = path.join(process.cwd(), 'server', 'data');
+const examsFile = path.join(dataDir, 'exams.json');
+
+>>>>>>> d41a1f7 (update backend files)
 function ensureDataFile() {
   if (!fs.existsSync(dataDir)) {
     fs.mkdirSync(dataDir, { recursive: true });
   }
+<<<<<<< HEAD
   if (!fs.existsSync(uploadsDir)) {
     fs.mkdirSync(uploadsDir, { recursive: true });
   }
@@ -112,6 +124,11 @@ function ensureDataFile() {
   if (!fs.existsSync(materialsFile)) {
     fs.writeFileSync(materialsFile, JSON.stringify([]));
   }
+=======
+  if (!fs.existsSync(examsFile)) {
+    fs.writeFileSync(examsFile, JSON.stringify([]));
+  }
+>>>>>>> d41a1f7 (update backend files)
 }
 
 ensureDataFile();
@@ -129,14 +146,23 @@ async function connectMongo() {
       level: { type: String, required: true },
       tfCount: { type: Number, default: 0 },
       mcqCount: { type: Number, default: 0 },
+<<<<<<< HEAD
       questions: { type: Array, default: [] },
+=======
+>>>>>>> d41a1f7 (update backend files)
       createdAt: { type: Date, default: Date.now },
     }, { timestamps: true });
     ExamModel = mongoose.model('Exam', examSchema);
     dbConnected = true;
+<<<<<<< HEAD
     // connected
   } catch (e) {
     // connection failed
+=======
+    console.log('MongoDB connected');
+  } catch (e) {
+    console.error('MongoDB connection failed:', e.message);
+>>>>>>> d41a1f7 (update backend files)
     dbConnected = false;
   }
 }
@@ -145,6 +171,7 @@ await connectMongo();
 
 app.get('/', (_, res) => {
   res.status(200).send('CollageApp Server');
+<<<<<<< HEAD
 });
 
 app.get('/health/db', async (_, res) => {
@@ -285,6 +312,73 @@ app.delete('/api/schedules/:id', (req, res) => {
   } catch (e) {
     res.status(500).json({ error: 'db_error' });
   }
+=======
+});
+
+app.get('/health/db', async (_, res) => {
+  res.json({ state: dbConnected ? 1 : 0 });
+});
+
+app.get('/api/exams', async (_, res) => {
+  try {
+    if (dbConnected && ExamModel) {
+      const items = await ExamModel.find().sort({ createdAt: -1 }).lean();
+      res.json({ items: items.map(i => ({ ...i, id: i._id })) });
+      return;
+    }
+    const buf = fs.readFileSync(examsFile, 'utf-8');
+    const items = JSON.parse(buf);
+    res.json({ items });
+  } catch (e) {
+    res.status(500).json({ error: 'fetch_failed', message: e.message });
+  }
+});
+
+app.post('/api/exams', async (req, res) => {
+  try {
+    const { subject = '', department = '', level = '', tfCount = 0, mcqCount = 0 } = req.body || {};
+    if (!subject || !department || !level) {
+      res.status(400).json({ error: 'invalid_payload' });
+      return;
+    }
+    if (dbConnected && ExamModel) {
+      const doc = await ExamModel.create({ subject, department, level, tfCount, mcqCount });
+      res.json({ id: doc._id.toString() });
+      return;
+    }
+    const buf = fs.readFileSync(examsFile, 'utf-8');
+    const items = JSON.parse(buf);
+    const id = Math.random().toString(36).slice(2);
+    const createdAt = new Date().toISOString();
+    items.unshift({ id, subject, department, level, tfCount, mcqCount, createdAt });
+    fs.writeFileSync(examsFile, JSON.stringify(items, null, 2));
+    res.json({ id });
+  } catch (e) {
+    res.status(500).json({ error: 'create_failed', message: e.message });
+  }
+});
+
+app.delete('/api/exams/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (dbConnected && ExamModel) {
+      await ExamModel.findByIdAndDelete(id);
+      res.json({ ok: true });
+      return;
+    }
+    const buf = fs.readFileSync(examsFile, 'utf-8');
+    const items = JSON.parse(buf);
+    const next = items.filter(i => (i.id || i._id) !== id);
+    fs.writeFileSync(examsFile, JSON.stringify(next, null, 2));
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'delete_failed', message: e.message });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+>>>>>>> d41a1f7 (update backend files)
 });
 app.delete('/api/exams/:id', async (req, res) => {
   try {

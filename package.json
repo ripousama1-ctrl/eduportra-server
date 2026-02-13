@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 {
   "name": "collageapp-server",
   "version": "1.0.0",
@@ -14,3 +15,21 @@
     "morgan": "^1.10.0"
   }
 }
+=======
+{
+  "name": "collageapp-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "mongoose": "^8.3.4",
+    "morgan": "^1.10.0"
+  }
+}
+>>>>>>> d41a1f7 (update backend files)
