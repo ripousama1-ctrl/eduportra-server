@@ -17,6 +17,7 @@ const dataDir = path.join(process.cwd(), 'data');
 const examsFile = path.join(dataDir, 'exams.json');
 const attendanceFile = path.join(dataDir, 'attendance.json');
 const studentsFile = path.join(dataDir, 'students.json');
+const examResultsFile = path.join(dataDir, 'exam_results.json');
 
 function ensureDataFile() {
   if (!fs.existsSync(dataDir)) {
@@ -30,6 +31,9 @@ function ensureDataFile() {
   }
   if (!fs.existsSync(studentsFile)) {
     fs.writeFileSync(studentsFile, JSON.stringify([]));
+  }
+  if (!fs.existsSync(examResultsFile)) {
+    fs.writeFileSync(examResultsFile, JSON.stringify([]));
   }
 }
 
@@ -282,6 +286,44 @@ app.post('/api/students/import-bulk', (req, res) => {
     }
     fs.writeFileSync(studentsFile, JSON.stringify(items, null, 2));
     res.json({ ok: true, count: list.length });
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
+app.post('/api/exam-results', (req, res) => {
+  try {
+    const b = req.body || {};
+    const studentCode = String(b.studentCode || '').trim();
+    const examId = String(b.examId || '').trim();
+    const department = String(b.department || '').trim();
+    const level = String(b.level || '').trim();
+    const correct = Number(b.correct || 0);
+    const wrong = Number(b.wrong || 0);
+    const total = Number(b.total || 0);
+    const score = Number(b.score || 0);
+    const submittedAt = String(b.submittedAt || new Date().toISOString());
+    if (!studentCode || !examId) return res.status(400).json({ error: 'invalid_input' });
+    const buf = fs.readFileSync(examResultsFile, 'utf-8');
+    const items = JSON.parse(buf);
+    items.push({ studentCode, examId, department, level, correct, wrong, total, score, submittedAt });
+    fs.writeFileSync(examResultsFile, JSON.stringify(items, null, 2));
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
+app.get('/api/exam-results/latest', (req, res) => {
+  try {
+    const studentCode = String(req.query.studentCode || '').trim();
+    if (!studentCode) return res.status(400).json({ error: 'invalid_input' });
+    const buf = fs.readFileSync(examResultsFile, 'utf-8');
+    const items = JSON.parse(buf);
+    const list = items.filter(i => String(i.studentCode || '') === studentCode);
+    if (list.length === 0) return res.json({ result: null });
+    const latest = list.sort((a, b) => new Date(String(b.submittedAt || '')).getTime() - new Date(String(a.submittedAt || '')).getTime())[0];
+    res.json({ result: latest });
   } catch (e) {
     res.status(500).json({ error: 'db_error' });
   }
