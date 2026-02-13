@@ -20,7 +20,7 @@ app.use(cors({
   },
   credentials: true,
 }));
-app.use(express.json({ limit: process.env.JSON_LIMIT || '200kb' }));
+app.use(express.json({ limit: process.env.JSON_LIMIT || '50mb' }));
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
@@ -124,6 +124,8 @@ ensureDataFile();
 
 let dbConnected = false;
 let ExamModel = null;
+let MaterialsModel = null;
+let gfsBucket = null;
 
 async function connectMongo() {
   if (!MONGODB_URI) return;
@@ -139,6 +141,17 @@ async function connectMongo() {
       createdAt: { type: Date, default: Date.now },
     }, { timestamps: true });
     ExamModel = mongoose.model('Exam', examSchema);
+    const materialsSchema = new mongoose.Schema({
+      url: { type: String, required: true },
+      originalName: { type: String, default: '' },
+      department: { type: String, default: '' },
+      level: { type: String, default: '' },
+      subject: { type: String, default: '' },
+      teacherName: { type: String, default: '' },
+      uploadedAt: { type: Date, default: Date.now },
+    }, { timestamps: true });
+    MaterialsModel = mongoose.model('Material', materialsSchema);
+    gfsBucket = new mongoose.mongo.GridFSBucket(mongoose.connection.db, { bucketName: 'uploads' });
     dbConnected = true;
   } catch (e) {
     dbConnected = false;
@@ -153,6 +166,25 @@ app.get('/', (_, res) => {
 
 app.get('/health/db', async (_, res) => {
   res.json({ state: dbConnected ? 1 : 0 });
+});
+
+app.get('/files/:id', async (req, res) => {
+  try {
+    if (!dbConnected || !gfsBucket) return res.status(404).end();
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(404).end();
+    const oid = new mongoose.Types.ObjectId(id);
+    const stream = gfsBucket.openDownloadStream(oid);
+    stream.on('file', (file) => {
+      const ct = String(file.contentType || 'application/octet-stream');
+      res.setHeader('Content-Type', ct);
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+    });
+    stream.on('error', () => res.status(404).end());
+    stream.pipe(res);
+  } catch (_) {
+    res.status(404).end();
+  }
 });
 
 app.get('/api/exams', async (_, res) => {
@@ -260,7 +292,7 @@ app.post('/api/schedules', (req, res) => {
   }
 });
 
-app.post('/api/schedules/image', (req, res) => {
+app.post('/api/schedules/image', async (req, res) => {
   try {
     const b = req.body || {};
     const department = safeStr(b.department, 64);
@@ -273,16 +305,29 @@ app.post('/api/schedules/image', (req, res) => {
       try {
         const extGuess = (imageUrl.split(';')[0] || '').split('/').pop() || 'png';
         const ext = extGuess.toLowerCase() === 'jpeg' ? 'jpg' : extGuess.toLowerCase();
+        const contentType = `image/${ext}`;
         const base64Data = imageUrl.split('base64,').pop();
         let b64 = String(base64Data || '').trim().replace(/\s+/g, '');
         const mod = b64.length % 4;
         if (mod !== 0) b64 = b64 + '='.repeat(4 - mod);
         const buf = Buffer.from(b64, 'base64');
         if (!buf || buf.length === 0) return res.status(400).json({ error: 'invalid_file' });
-        const storedName = `${id}.${ext}`;
-        fs.writeFileSync(path.join(schedulesImgDir, storedName), buf);
-        imageUrl = `/uploads/schedules/${storedName}`;
-      } catch (e) {
+        if (dbConnected && gfsBucket) {
+          await new Promise((resolve, reject) => {
+            const upload = gfsBucket.openUploadStream(`${id}.${ext}`, { contentType });
+            upload.on('finish', (file) => {
+              imageUrl = `/files/${file._id.toString()}`;
+              resolve();
+            });
+            upload.on('error', reject);
+            upload.end(buf);
+          });
+        } else {
+          const storedName = `${id}.${ext}`;
+          fs.writeFileSync(path.join(schedulesImgDir, storedName), buf);
+          imageUrl = `/uploads/schedules/${storedName}`;
+        }
+      } catch (_) {
         return res.status(400).json({ error: 'invalid_file' });
       }
     }
@@ -562,11 +607,19 @@ app.post('/api/announcements/:id/read', (req, res) => {
 });
 
 // Course Materials (PDF)
-app.get('/api/materials', (req, res) => {
+app.get('/api/materials', async (req, res) => {
   try {
     const department = safeStr(req.query.department, 64);
     const level = safeStr(req.query.level, 64);
     const subject = safeStr(req.query.subject, 128);
+    if (dbConnected && MaterialsModel) {
+      const query = {};
+      if (department) query.department = department;
+      if (level) query.level = level;
+      if (subject) query.subject = subject;
+      const items = await MaterialsModel.find(query).sort({ uploadedAt: -1 }).lean();
+      return res.json({ items: items.map(i => ({ ...i, id: i._id })) });
+    }
     const buf = fs.readFileSync(materialsFile, 'utf-8');
     const items = JSON.parse(buf);
     const filtered = items.filter(m => {
@@ -583,7 +636,7 @@ app.get('/api/materials', (req, res) => {
 
 app.post('/api/materials', async (req, res) => {
   try {
-    const MAX_SIZE = Number(process.env.MAX_MATERIAL_SIZE || 25 * 1024 * 1024); // 25MB default
+    const MAX_SIZE = Number(process.env.MAX_MATERIAL_SIZE || 25 * 1024 * 1024);
     const b = req.body || {};
     const department = safeStr(b.department, 64);
     const level = safeStr(b.level, 64);
@@ -595,13 +648,28 @@ app.post('/api/materials', async (req, res) => {
     const nameLower = fileName.toLowerCase();
     if (!nameLower.endsWith('.pdf')) return res.status(400).json({ error: 'invalid_type' });
     const base64Data = fileBase64.includes('base64,') ? fileBase64.split('base64,').pop() : fileBase64;
-    const buf = Buffer.from(base64Data, 'base64');
+    let b64 = String(base64Data || '').trim().replace(/\s+/g, '');
+    const mod = b64.length % 4;
+    if (mod !== 0) b64 = b64 + '='.repeat(4 - mod);
+    const buf = Buffer.from(b64, 'base64');
     if (!buf || buf.length === 0) return res.status(400).json({ error: 'invalid_file' });
     if (buf.length > MAX_SIZE) return res.status(413).json({ error: 'file_too_large' });
+    let url = '';
+    if (dbConnected && gfsBucket && MaterialsModel) {
+      const fileId = await new Promise((resolve, reject) => {
+        const upload = gfsBucket.openUploadStream(fileName, { contentType: 'application/pdf' });
+        upload.on('finish', (file) => resolve(file._id.toString()));
+        upload.on('error', reject);
+        upload.end(buf);
+      });
+      url = `/files/${fileId}`;
+      const doc = await MaterialsModel.create({ url, originalName: fileName, department, level, subject, teacherName, uploadedAt: new Date() });
+      return res.json({ id: doc._id.toString(), url });
+    }
     const id = Math.random().toString(36).slice(2);
     const storedName = `${id}.pdf`;
     await fs.promises.writeFile(path.join(materialsDir, storedName), buf);
-    const url = `/uploads/materials/${storedName}`;
+    url = `/uploads/materials/${storedName}`;
     const uploadedAt = new Date().toISOString();
     await queueWrite(materialsFile, (items) => {
       items.unshift({ id, url, originalName: fileName, department, level, subject, teacherName, uploadedAt });
@@ -617,6 +685,15 @@ app.delete('/api/materials/:id', async (req, res) => {
   try {
     const id = safeStr(req.params.id, 64);
     if (!id) return res.status(400).json({ error: 'invalid_input' });
+    if (dbConnected && MaterialsModel) {
+      const doc = await MaterialsModel.findById(id).lean();
+      if (doc && doc.url && gfsBucket) {
+        const fid = String(doc.url).replace('/files/', '').trim();
+        try { await gfsBucket.delete(new mongoose.Types.ObjectId(fid)); } catch (_) {}
+      }
+      await MaterialsModel.findByIdAndDelete(id);
+      return res.json({ ok: true });
+    }
     let fileToDelete = null;
     await queueWrite(materialsFile, (items) => {
       const found = items.find(m => String(m.id || m._id) === id);
