@@ -126,6 +126,7 @@ let dbConnected = false;
 let ExamModel = null;
 let MaterialsModel = null;
 let SessionModel = null;
+let StudentModel = null;
 let gfsBucket = null;
 const sessions = new Map();
 const sessionsByCode = new Map();
@@ -154,6 +155,16 @@ async function connectMongo() {
       uploadedAt: { type: Date, default: Date.now },
     }, { timestamps: true });
     MaterialsModel = mongoose.model('Material', materialsSchema);
+    const studentSchema = new mongoose.Schema({
+      studentCode: { type: String, required: true, unique: true, index: true },
+      fullName: { type: String, required: true },
+      department: { type: String, default: '' },
+      level: { type: String, default: '' },
+      status: { type: String, default: '' },
+      createdAt: { type: Date, default: Date.now },
+    }, { timestamps: true });
+    studentSchema.index({ studentCode: 1 }, { unique: true });
+    StudentModel = mongoose.model('Student', studentSchema);
     const sessionSchema = new mongoose.Schema({
       userId: { type: String, required: true, index: true },
       lectureId: { type: String, required: true, index: true },
@@ -508,6 +519,22 @@ app.get('/api/students', (req, res) => {
   try {
     const department = String(req.query.department || '').trim();
     const level = String(req.query.level || '').trim();
+    if (dbConnected && StudentModel) {
+      const query = {};
+      if (department) query.department = department;
+      if (level) query.level = level;
+      StudentModel.find(query).lean().then(items => {
+        const normalized = items.map(s => ({
+          studentCode: String(s.studentCode || '').trim(),
+          fullName: String(s.fullName || '').trim(),
+          department: String(s.department || '').trim(),
+          level: String(s.level || '').trim(),
+          status: String(s.status || '').trim(),
+        }));
+        res.json({ students: normalized });
+      }).catch(() => res.status(500).json({ error: 'db_error' }));
+      return;
+    }
     const buf = fs.readFileSync(studentsFile, 'utf-8');
     const items = JSON.parse(buf);
     const normalized = items.map(s => ({
@@ -537,6 +564,15 @@ app.post('/api/students', (req, res) => {
     const level = safeStr(b.level, 64);
     const status = safeStr(b.status, 64);
     if (!studentCode || !fullName) return res.status(400).json({ error: 'invalid_input' });
+    if (dbConnected && StudentModel) {
+      StudentModel.updateOne(
+        { studentCode },
+        { $setOnInsert: { studentCode, fullName, department, level, status } },
+        { upsert: true }
+      ).then(() => res.json({ ok: true }))
+       .catch(() => res.status(500).json({ error: 'db_error' }));
+      return;
+    }
     queueWrite(studentsFile, (items) => {
       if (items.find(s => String(s.studentCode || s.code || '') === studentCode)) {
         return items;
@@ -553,6 +589,12 @@ app.delete('/api/students/:code', (req, res) => {
   try {
     const code = safeStr(req.params.code, 64);
     if (!code) return res.status(400).json({ error: 'invalid_input' });
+    if (dbConnected && StudentModel) {
+      StudentModel.deleteOne({ studentCode: code })
+        .then(() => res.json({ ok: true }))
+        .catch(() => res.status(500).json({ error: 'db_error' }));
+      return;
+    }
     queueWrite(studentsFile, (items) => items.filter(s => String(s.studentCode || s.code || '') !== code))
       .then(() => res.json({ ok: true }))
       .catch(() => res.status(500).json({ error: 'db_error' }));
@@ -565,6 +607,24 @@ app.delete('/api/students/:code', (req, res) => {
 app.post('/api/students/import-bulk', (req, res) => {
   try {
     const list = Array.isArray(req.body) ? req.body : [];
+    if (dbConnected && StudentModel) {
+      const docs = [];
+      for (const raw of list) {
+        const studentCode = safeStr(raw.studentCode || raw.code, 64);
+        const fullName = safeStr(raw.fullName || raw.name, 128);
+        const department = safeStr(raw.department, 64);
+        const level = safeStr(raw.level, 64);
+        const status = safeStr(raw.status, 64);
+        if (!studentCode || !fullName) continue;
+        docs.push({ studentCode, fullName, department, level, status });
+      }
+      if (docs.length === 0) return res.json({ ok: true, count: 0 });
+      StudentModel.bulkWrite(
+        docs.map(d => ({ updateOne: { filter: { studentCode: d.studentCode }, update: { $setOnInsert: d }, upsert: true } }))
+      ).then(r => res.json({ ok: true, count: docs.length }))
+       .catch(() => res.status(500).json({ error: 'db_error' }));
+      return;
+    }
     queueWrite(studentsFile, (items) => {
       const byCode = new Map(items.map(s => [String(s.studentCode || s.code || ''), s]));
       for (const raw of list) {
@@ -800,23 +860,38 @@ app.post('/api/auth/login', (req, res) => {
     const username = String(b.username || '').trim();
     const password = String(b.password || '').trim();
     if (studentCode) {
+      if (dbConnected && StudentModel) {
+        StudentModel.findOne({ studentCode: studentCode }).lean().then(s => {
+          if (!s) return res.status(401).json({ error: 'invalid_credentials' });
+          return res.json({
+            user: {
+              role: 'student',
+              studentCode: String(s.studentCode || ''),
+              fullName: String(s.fullName || ''),
+              department: String(s.department || ''),
+              level: String(s.level || ''),
+            }
+          });
+        }).catch(() => res.status(500).json({ error: 'auth_error' }));
+        return;
+      }
       const buf = fs.readFileSync(studentsFile, 'utf-8');
       const items = JSON.parse(buf);
       const s = items.find(it => String(it.studentCode || it.code || '').trim().toLowerCase() === studentCode);
-    if (!s) {
-      if (Array.isArray(items) && items.length === 0) {
-        return res.json({
-          user: {
-            role: 'student',
-            studentCode: studentCode,
-            fullName: 'طالب',
-            department: '',
-            level: '',
-          }
-        });
+      if (!s) {
+        if (Array.isArray(items) && items.length === 0) {
+          return res.json({
+            user: {
+              role: 'student',
+              studentCode: studentCode,
+              fullName: 'طالب',
+              department: '',
+              level: '',
+            }
+          });
+        }
+        return res.status(401).json({ error: 'invalid_credentials' });
       }
-      return res.status(401).json({ error: 'invalid_credentials' });
-    }
       return res.json({
         user: {
           role: 'student',
