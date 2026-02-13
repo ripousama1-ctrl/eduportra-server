@@ -39,6 +39,7 @@ const schedulesFile = path.join(dataDir, 'schedules.json');
 const announcementsFile = path.join(dataDir, 'announcements.json');
 const uploadsDir = path.join(process.cwd(), 'uploads');
 const materialsDir = path.join(uploadsDir, 'materials');
+const schedulesImgDir = path.join(uploadsDir, 'schedules');
 const materialsFile = path.join(dataDir, 'materials.json');
 
 // Static files for uploads (PDFs)
@@ -92,6 +93,9 @@ function ensureDataFile() {
   }
   if (!fs.existsSync(materialsDir)) {
     fs.mkdirSync(materialsDir, { recursive: true });
+  }
+  if (!fs.existsSync(schedulesImgDir)) {
+    fs.mkdirSync(schedulesImgDir, { recursive: true });
   }
   if (!fs.existsSync(examsFile)) {
     fs.writeFileSync(examsFile, JSON.stringify([]));
@@ -261,15 +265,32 @@ app.post('/api/schedules/image', (req, res) => {
     const b = req.body || {};
     const department = safeStr(b.department, 64);
     const level = safeStr(b.level, 64);
-    const imageUrl = safeStr(b.imageUrl, 512);
+    let imageUrl = safeStr(b.imageUrl, 500000);
     const isExam = Boolean(b.isExam);
     if (!department || !level || !imageUrl) return res.status(400).json({ error: 'invalid_input' });
     const id = Math.random().toString(36).slice(2);
+    if (imageUrl.startsWith('data:') && imageUrl.includes('base64,')) {
+      try {
+        const extGuess = (imageUrl.split(';')[0] || '').split('/').pop() || 'png';
+        const ext = extGuess.toLowerCase() === 'jpeg' ? 'jpg' : extGuess.toLowerCase();
+        const base64Data = imageUrl.split('base64,').pop();
+        let b64 = String(base64Data || '').trim().replace(/\s+/g, '');
+        const mod = b64.length % 4;
+        if (mod !== 0) b64 = b64 + '='.repeat(4 - mod);
+        const buf = Buffer.from(b64, 'base64');
+        if (!buf || buf.length === 0) return res.status(400).json({ error: 'invalid_file' });
+        const storedName = `${id}.${ext}`;
+        fs.writeFileSync(path.join(schedulesImgDir, storedName), buf);
+        imageUrl = `/uploads/schedules/${storedName}`;
+      } catch (e) {
+        return res.status(400).json({ error: 'invalid_file' });
+      }
+    }
     const item = { id, subject: '', day: '', date: '', time: '', location: '', department, level, imageUrl, isExam };
     queueWrite(schedulesFile, (items) => {
       items.unshift(item);
       return items;
-    }).then(() => res.json({ id })).catch(() => res.status(500).json({ error: 'db_error' }));
+    }).then(() => res.json({ id, url: imageUrl })).catch(() => res.status(500).json({ error: 'db_error' }));
   } catch (e) {
     res.status(500).json({ error: 'db_error' });
   }
@@ -562,7 +583,7 @@ app.get('/api/materials', (req, res) => {
 
 app.post('/api/materials', async (req, res) => {
   try {
-    const MAX_SIZE = Number(process.env.MAX_MATERIAL_SIZE || 10 * 1024 * 1024); // 10MB
+    const MAX_SIZE = Number(process.env.MAX_MATERIAL_SIZE || 25 * 1024 * 1024); // 25MB default
     const b = req.body || {};
     const department = safeStr(b.department, 64);
     const level = safeStr(b.level, 64);
