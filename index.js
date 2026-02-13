@@ -203,7 +203,6 @@ app.delete('/api/attendance/all', (req, res) => {
   }
 });
 
-// Students
 app.get('/api/students', (req, res) => {
   try {
     const department = String(req.query.department || '').trim();
@@ -283,6 +282,83 @@ app.post('/api/students/import-bulk', (req, res) => {
     }
     fs.writeFileSync(studentsFile, JSON.stringify(items, null, 2));
     res.json({ ok: true, count: list.length });
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
+app.post('/api/auth/login', (req, res) => {
+  try {
+    const b = req.body || {};
+    const studentCode = String(b.studentCode || '').trim().toLowerCase();
+    const username = String(b.username || '').trim();
+    const password = String(b.password || '').trim();
+    if (studentCode) {
+      const buf = fs.readFileSync(studentsFile, 'utf-8');
+      const items = JSON.parse(buf);
+      const s = items.find(it => String(it.studentCode || it.code || '').trim().toLowerCase() === studentCode);
+    if (!s) {
+      if (Array.isArray(items) && items.length === 0) {
+        return res.json({
+          user: {
+            role: 'student',
+            studentCode: studentCode,
+            fullName: 'طالب',
+            department: '',
+            level: '',
+          }
+        });
+      }
+      return res.status(401).json({ error: 'invalid_credentials' });
+    }
+      return res.json({
+        user: {
+          role: 'student',
+          studentCode: String(s.studentCode || s.code || ''),
+          fullName: String(s.fullName || s.name || ''),
+          department: String(s.department || ''),
+          level: String(s.level || ''),
+        }
+      });
+    }
+    if (username && password) {
+      if (username === 'admin' && password === 'admin') {
+        return res.json({ user: { role: 'admin', id: 'admin' } });
+      }
+      return res.status(401).json({ error: 'invalid_credentials' });
+    }
+    res.status(400).json({ error: 'invalid_payload' });
+  } catch (e) {
+    res.status(500).json({ error: 'auth_error' });
+  }
+});
+
+app.post('/mark-attendance', (req, res) => {
+  try {
+    const b = req.body || {};
+    const lectureId = String(b.lectureId || '').trim();
+    const timestamp = Number(b.timestamp || Date.now());
+    const studentCode = String(b.studentId || b.studentCode || '').trim();
+    const studentName = String(b.name || b.studentName || '').trim();
+    const department = String(b.department || '').trim();
+    const level = String(b.level || '').trim();
+    const status = String(b.status || '').trim();
+    if (!lectureId || !studentCode || !studentName) {
+      return res.status(400).json({ error: 'invalid_input' });
+    }
+    const buf = fs.readFileSync(attendanceFile, 'utf-8');
+    const items = JSON.parse(buf);
+    items.push({
+      lectureId,
+      time: timestamp,
+      studentCode,
+      studentName,
+      department,
+      level,
+      status,
+    });
+    fs.writeFileSync(attendanceFile, JSON.stringify(items, null, 2));
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: 'db_error' });
   }
