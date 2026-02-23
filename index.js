@@ -585,6 +585,44 @@ app.post('/api/students', (req, res) => {
   }
 });
 
+app.patch('/api/students/:code', (req, res) => {
+  try {
+    const code = safeStr(req.params.code, 64);
+    if (!code) return res.status(400).json({ error: 'invalid_input' });
+    const b = req.body || {};
+    const status = safeStr(b.status, 64);
+    const fullName = safeStr(b.fullName || b.name, 128);
+    const department = safeStr(b.department, 64);
+    const level = safeStr(b.level, 64);
+    if (dbConnected && StudentModel) {
+      const $set = {};
+      if (status) $set.status = status;
+      if (fullName) $set.fullName = fullName;
+      if (department) $set.department = department;
+      if (level) $set.level = level;
+      if (Object.keys($set).length === 0) return res.json({ ok: true });
+      StudentModel.updateOne({ studentCode: code }, { $set }, { upsert: false })
+        .then(() => res.json({ ok: true }))
+        .catch(() => res.status(500).json({ error: 'db_error' }));
+      return;
+    }
+    queueWrite(studentsFile, (items) => {
+      const idx = items.findIndex(s => String(s.studentCode || s.code || '') === code);
+      if (idx >= 0) {
+        if (status) items[idx].status = status;
+        if (fullName) items[idx].fullName = fullName;
+        if (department) items[idx].department = department;
+        if (level) items[idx].level = level;
+      } else {
+        items.push({ studentCode: code, fullName, department, level, status });
+      }
+      return items;
+    }).then(() => res.json({ ok: true })).catch(() => res.status(500).json({ error: 'db_error' }));
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
 app.delete('/api/students/:code', (req, res) => {
   try {
     const code = safeStr(req.params.code, 64);
