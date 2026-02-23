@@ -39,6 +39,7 @@ const schedulesFile = path.join(dataDir, 'schedules.json');
 const announcementsFile = path.join(dataDir, 'announcements.json');
 const uploadsDir = path.join(process.cwd(), 'uploads');
 const materialsDir = path.join(uploadsDir, 'materials');
+const announcementsImgDir = path.join(uploadsDir, 'announcements');
 const schedulesImgDir = path.join(uploadsDir, 'schedules');
 const materialsFile = path.join(dataDir, 'materials.json');
 
@@ -93,6 +94,9 @@ function ensureDataFile() {
   }
   if (!fs.existsSync(materialsDir)) {
     fs.mkdirSync(materialsDir, { recursive: true });
+  }
+  if (!fs.existsSync(announcementsImgDir)) {
+    fs.mkdirSync(announcementsImgDir, { recursive: true });
   }
   if (!fs.existsSync(schedulesImgDir)) {
     fs.mkdirSync(schedulesImgDir, { recursive: true });
@@ -741,11 +745,29 @@ app.post('/api/announcements', (req, res) => {
     const readByStudentIds = Array.isArray(b.readByStudentIds) ? b.readByStudentIds.map(s => safeStr(s, 64)) : [];
     if (!title || !content) return res.status(400).json({ error: 'invalid_input' });
     const id = Math.random().toString(36).slice(2);
-    const item = { id, title, content, date, priority, readByStudentIds };
+    let imageUrl = '';
+    const imageName = safeStr(b.imageName, 128);
+    const imageBase64 = String(b.imageBase64 || '');
+    if (imageBase64 && imageName) {
+      const lower = imageName.toLowerCase();
+      const allowed = ['.png', '.jpg', '.jpeg', '.webp'];
+      const ext = allowed.find(e => lower.endsWith(e)) || '';
+      if (!ext) return res.status(400).json({ error: 'invalid_image_type' });
+      const base64Data = imageBase64.includes('base64,') ? imageBase64.split('base64,').pop() : imageBase64;
+      let b64 = String(base64Data || '').trim().replace(/\s+/g, '');
+      const mod = b64.length % 4;
+      if (mod !== 0) b64 = b64 + '='.repeat(4 - mod);
+      const buf = Buffer.from(b64, 'base64');
+      if (!buf || buf.length === 0) return res.status(400).json({ error: 'invalid_image' });
+      const storedName = `${id}${ext}`;
+      fs.writeFileSync(path.join(announcementsImgDir, storedName), buf);
+      imageUrl = `/uploads/announcements/${storedName}`;
+    }
+    const item = { id, title, content, date, priority, readByStudentIds, imageUrl };
     queueWrite(announcementsFile, (items) => {
       items.unshift(item);
       return items;
-    }).then(() => res.json({ id })).catch(() => res.status(500).json({ error: 'db_error' }));
+    }).then(() => res.json({ id, imageUrl })).catch(() => res.status(500).json({ error: 'db_error' }));
   } catch (e) {
     res.status(500).json({ error: 'db_error' });
   }
@@ -755,7 +777,22 @@ app.delete('/api/announcements/:id', (req, res) => {
   try {
     const id = safeStr(req.params.id, 64);
     if (!id) return res.status(400).json({ error: 'invalid_input' });
-    queueWrite(announcementsFile, (items) => items.filter(i => String(i.id || i._id) !== id))
+    queueWrite(announcementsFile, (items) => {
+      let removed = null;
+      const next = [];
+      for (const it of items) {
+        if (String(it.id || it._id) === id) {
+          removed = it;
+          continue;
+        }
+        next.push(it);
+      }
+      if (removed && removed.imageUrl && String(removed.imageUrl).startsWith('/uploads/announcements/')) {
+        const p = path.join(process.cwd(), removed.imageUrl.replace('/uploads/', 'uploads/'));
+        try { fs.unlinkSync(p); } catch (_) {}
+      }
+      return next;
+    })
       .then(() => res.json({ ok: true }))
       .catch(() => res.status(500).json({ error: 'db_error' }));
   } catch (e) {
