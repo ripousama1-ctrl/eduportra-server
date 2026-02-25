@@ -763,7 +763,7 @@ app.post('/api/announcements', (req, res) => {
       fs.writeFileSync(path.join(announcementsImgDir, storedName), buf);
       imageUrl = `/uploads/announcements/${storedName}`;
     }
-    const item = { id, title, content, date, priority, readByStudentIds, imageUrl };
+    const item = { id, title, content, date, priority, readByStudentIds, imageUrl, likes: [], comments: [] };
     queueWrite(announcementsFile, (items) => {
       items.unshift(item);
       return items;
@@ -815,6 +815,86 @@ app.post('/api/announcements/:id/read', (req, res) => {
       }
       return items;
     }).then(() => res.json({ ok: true })).catch(() => res.status(500).json({ error: 'db_error' }));
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
+// Announcement detail
+app.get('/api/announcements/:id', (req, res) => {
+  try {
+    const id = safeStr(req.params.id, 64);
+    if (!id) return res.status(400).json({ error: 'invalid_input' });
+    const buf = fs.readFileSync(announcementsFile, 'utf-8');
+    const items = JSON.parse(buf);
+    const it = items.find(x => String(x.id || x._id) === id);
+    if (!it) return res.status(404).json({ error: 'not_found' });
+    if (!Array.isArray(it.likes)) it.likes = [];
+    if (!Array.isArray(it.comments)) it.comments = [];
+    res.json({ item: it, likesCount: it.likes.length, commentsCount: it.comments.length });
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
+// Like / Unlike announcement
+app.post('/api/announcements/:id/like', (req, res) => {
+  try {
+    const id = safeStr(req.params.id, 64);
+    const userId = safeStr((req.body || {}).userId, 64);
+    if (!id || !userId) return res.status(400).json({ error: 'invalid_input' });
+    let liked = false;
+    queueWrite(announcementsFile, (items) => {
+      for (const it of items) {
+        if (String(it.id || it._id) === id) {
+          if (!Array.isArray(it.likes)) it.likes = [];
+          const idx = it.likes.indexOf(userId);
+          if (idx >= 0) {
+            it.likes.splice(idx, 1);
+            liked = false;
+          } else {
+            it.likes.push(userId);
+            liked = true;
+          }
+          break;
+        }
+      }
+      return items;
+    })
+      .then(() => res.json({ liked, likesCount: undefined }))
+      .catch(() => res.status(500).json({ error: 'db_error' }));
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
+// Add comment
+app.post('/api/announcements/:id/comment', (req, res) => {
+  try {
+    const id = safeStr(req.params.id, 64);
+    const b = req.body || {};
+    const userId = safeStr(b.userId, 64);
+    const userType = safeStr(b.userType || 'student', 16);
+    const name = safeStr(b.name || '', 128);
+    const text = safeStr(b.text || '', 2000);
+    if (!id || !userId || !text) return res.status(400).json({ error: 'invalid_input' });
+    const comment = {
+      id: Math.random().toString(36).slice(2),
+      userId, userType, name, text,
+      createdAt: new Date().toISOString(),
+    };
+    queueWrite(announcementsFile, (items) => {
+      for (const it of items) {
+        if (String(it.id || it._id) === id) {
+          if (!Array.isArray(it.comments)) it.comments = [];
+          it.comments.push(comment);
+          break;
+        }
+      }
+      return items;
+    })
+      .then(() => res.json({ ok: true, comment }))
+      .catch(() => res.status(500).json({ error: 'db_error' }));
   } catch (e) {
     res.status(500).json({ error: 'db_error' });
   }
