@@ -446,6 +446,37 @@ app.delete('/api/schedules/:id', (req, res) => {
     res.status(500).json({ error: 'db_error' });
   }
 });
+// Update schedule
+app.patch('/api/schedules/:id', (req, res) => {
+  try {
+    const id = safeStr(req.params.id, 64);
+    if (!id) return res.status(400).json({ error: 'invalid_input' });
+    const b = req.body || {};
+    const updates = {
+      subject: safeStr(b.subject ?? '', 128),
+      day: safeStr(b.day ?? '', 64),
+      date: safeStr(b.date ?? '', 64),
+      time: safeStr(b.time ?? '', 64),
+      location: safeStr(b.location ?? '', 128),
+      department: safeStr(b.department ?? '', 64),
+      level: safeStr(b.level ?? '', 64),
+    };
+    queueWrite(schedulesFile, (items) => {
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (String(it.id || it._id) === id) {
+          items[i] = { ...it, ...Object.fromEntries(Object.entries(updates).filter(([_, v]) => v !== '')) };
+          break;
+        }
+      }
+      return items;
+    })
+      .then(() => res.json({ ok: true }))
+      .catch(() => res.status(500).json({ error: 'db_error' }));
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
 app.delete('/api/exams/:id', async (req, res) => {
   try {
     const { id } = req.params;
