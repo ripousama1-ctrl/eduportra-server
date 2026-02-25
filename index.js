@@ -900,6 +900,74 @@ app.post('/api/announcements/:id/comment', (req, res) => {
   }
 });
 
+// Edit comment
+app.patch('/api/announcements/:id/comment/:cid', (req, res) => {
+  try {
+    const id = safeStr(req.params.id, 64);
+    const cid = safeStr(req.params.cid, 64);
+    const b = req.body || {};
+    const userId = safeStr(b.userId, 64);
+    const userType = safeStr(b.userType || 'student', 16);
+    const text = safeStr(b.text || '', 2000);
+    if (!id || !cid || !userId || !text) return res.status(400).json({ error: 'invalid_input' });
+    let ok = false;
+    queueWrite(announcementsFile, (items) => {
+      for (const it of items) {
+        if (String(it.id || it._id) === id) {
+          const idx = Array.isArray(it.comments) ? it.comments.findIndex(c => String(c.id) === cid) : -1;
+          if (idx >= 0) {
+            const c = it.comments[idx] || {};
+            if (String(c.userId || '') === userId || ['admin', 'teacher'].includes(userType)) {
+              it.comments[idx].text = text;
+              it.comments[idx].editedAt = new Date().toISOString();
+              ok = true;
+            }
+          }
+          break;
+        }
+      }
+      return items;
+    })
+      .then(() => res.json({ ok }))
+      .catch(() => res.status(500).json({ error: 'db_error' }));
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
+// Delete comment
+app.delete('/api/announcements/:id/comment/:cid', (req, res) => {
+  try {
+    const id = safeStr(req.params.id, 64);
+    const cid = safeStr(req.params.cid, 64);
+    const userId = safeStr(req.query.userId, 64);
+    const userType = safeStr(req.query.userType || 'student', 16);
+    if (!id || !cid || !userId) return res.status(400).json({ error: 'invalid_input' });
+    let ok = false;
+    queueWrite(announcementsFile, (items) => {
+      for (const it of items) {
+        if (String(it.id || it._id) === id) {
+          if (!Array.isArray(it.comments)) it.comments = [];
+          const idx = it.comments.findIndex(c => String(c.id) === cid);
+          if (idx >= 0) {
+            const c = it.comments[idx] || {};
+            if (String(c.userId || '') === userId || ['admin', 'teacher'].includes(userType)) {
+              it.comments.splice(idx, 1);
+              ok = true;
+            }
+          }
+          break;
+        }
+      }
+      return items;
+    })
+      .then(() => res.json({ ok }))
+      .catch(() => res.status(500).json({ error: 'db_error' }));
+  } catch (e) {
+    res.status(500).json({ error: 'db_error' });
+  }
+});
+
 // Course Materials (PDF)
 app.get('/api/materials', async (req, res) => {
   try {
