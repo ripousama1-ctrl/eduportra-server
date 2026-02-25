@@ -342,6 +342,147 @@ app.get('/api/exams/:id', async (req, res) => {
   }
 });
 
+app.patch('/api/exams/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const b = req.body || {};
+    const subject = safeStr(b.subject ?? '', 100);
+    const department = safeStr(b.department ?? '', 100);
+    const level = safeStr(b.level ?? '', 100);
+    const tfCount = Number(b.tfCount ?? 0);
+    const mcqCount = Number(b.mcqCount ?? 0);
+    const questions = Array.isArray(b.questions) ? b.questions : [];
+    if (dbConnected && ExamModel) {
+      const doc = await ExamModel.findById(id);
+      if (!doc) return res.status(404).json({ error: 'not_found' });
+      if (subject) doc.subject = subject;
+      if (department) doc.department = department;
+      if (level) doc.level = level;
+      if (tfCount || mcqCount) {
+        doc.tfCount = tfCount;
+        doc.mcqCount = mcqCount;
+      }
+      if (questions.length) doc.questions = questions;
+      await doc.save();
+      res.json({ ok: true });
+      return;
+    }
+    await queueWrite(examsFile, (items) => {
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (String(it.id || it._id) === id) {
+          const next = { ...it };
+          if (subject) next.subject = subject;
+          if (department) next.department = department;
+          if (level) next.level = level;
+          if (questions.length) next.questions = questions;
+          next.tfCount = tfCount || next.tfCount || 0;
+          next.mcqCount = mcqCount || next.mcqCount || 0;
+          items[i] = next;
+          break;
+        }
+      }
+      return items;
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'update_failed' });
+  }
+});
+
+app.post('/api/exams/import', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const fileName = safeStr(b.fileName, 128);
+    const fileBase64 = String(b.fileBase64 || '');
+    const subject = safeStr(b.subject || 'اختبار', 128);
+    const department = safeStr(b.department || '', 64);
+    const level = safeStr(b.level || '', 64);
+    if (!fileName || !fileBase64) return res.status(400).json({ error: 'invalid_input' });
+    const base64Data = fileBase64.includes('base64,') ? fileBase64.split('base64,').pop() : fileBase64;
+    let buf = Buffer.from(base64Data, 'base64');
+    let text = '';
+    try {
+      if (fileName.toLowerCase().endsWith('.docx')) {
+        let mammoth;
+        try { mammoth = require('mammoth'); } catch (_) {}
+        if (mammoth) {
+          const r = await mammoth.extractRawText({ buffer: buf });
+          text = String(r.value || '');
+        }
+      } else if (fileName.toLowerCase().endsWith('.pdf')) {
+        let pdfParse;
+        try { pdfParse = require('pdf-parse'); } catch (_) {}
+        if (pdfParse) {
+          const r = await pdfParse(buf);
+          text = String(r.text || '');
+        }
+      }
+    } catch (_) {}
+    if (!text) {
+      try {
+        text = buf.toString('utf8');
+      } catch (_) {}
+    }
+    if (!text || text.trim().length === 0) return res.status(400).json({ error: 'parse_failed' });
+    const lines = text.replace(/\r/g, '').split('\n').map(s => s.trim()).filter(s => s.length > 0);
+    const questions = [];
+    let i = 0;
+    while (i < lines.length) {
+      let q = lines[i];
+      const mcqMatch = q.match(/^\d+\)|^Q\.|^س[:.\-\s]|^\(?[A-Za-z]\)|^\(?\d+\)?\s/);
+      const hasOptionsAhead = (j) => {
+        let cnt = 0;
+        for (let k = j; k < Math.min(j + 6, lines.length); k++) {
+          if (/^(?:A|B|C|D|أ|ب|ج|د)[\).:\-]\s/i.test(lines[k])) cnt++;
+        }
+        return cnt >= 2;
+      };
+      if (hasOptionsAhead(i + 1)) {
+        const opts = [];
+        let correctIndex = 0;
+        let optCount = 0;
+        let j = i + 1;
+        while (j < Math.min(i + 10, lines.length) && optCount < 6) {
+          const m = lines[j].match(/^(A|B|C|D|أ|ب|ج|د)[\).:\-]\s*(.*)$/i);
+          if (m) {
+            let opt = m[2].trim();
+            if (/\*$/.test(opt)) {
+              correctIndex = opts.length;
+              opt = opt.replace(/\*+$/, '').trim();
+            }
+            opts.push(opt);
+            optCount++;
+          } else {
+            break;
+          }
+          j++;
+        }
+        if (opts.length >= 2) {
+          questions.push({ type: 'mcq', question: q.replace(/^\d+\)|^Q\.|^س[:.\-\s]|^\(?[A-Za-z]\)\s?/, '').trim(), options: opts.slice(0, 4), correctIndex: Math.min(correctIndex, Math.max(0, opts.length - 1)) });
+          i = j;
+          continue;
+        }
+      }
+      if (/(?:\b[TF]\b|صح|خط[اأ]ء|true|false)/i.test(q)) {
+        let correct = 'true';
+        if (/\bF\b|false|\bخط[اأ]ء\b/i.test(q)) correct = 'false';
+        const cleaned = q
+          .replace(/\s*(?:\(?\s*(?:صح\/خطأ|True|False|T|F)\s*\)?)\s*$/ig, '')
+          .trim();
+        questions.push({ type: 'tf', question: cleaned, correct });
+        i++;
+        continue;
+      }
+      i++;
+    }
+    const tfCount = questions.filter(q => q.type === 'tf').length;
+    const mcqCount = questions.filter(q => q.type === 'mcq').length;
+    res.json({ subject, department, level, questions, tfCount, mcqCount });
+  } catch (e) {
+    res.status(500).json({ error: 'import_failed' });
+  }
+});
 // Schedules
 app.get('/api/schedules', (req, res) => {
   try {
